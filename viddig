@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+# ── Colors ───────────────────────────────────────────────
+R = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+PURPLE = "\033[38;5;141m"
+GREEN = "\033[38;5;114m"
+RED = "\033[38;5;203m"
+YELLOW = "\033[38;5;221m"
+CYAN = "\033[38;5;117m"
+GRAY = "\033[38;5;245m"
+
+VAULT_DIR = str(Path.home() / "Local Documents" / "Main Second Brain (Local)" / "Research" / "VidDig")
+OUTPUT_DIR = VAULT_DIR
+REGISTRY_ROOT = VAULT_DIR
+
+# ── Sentiment ─────────────────────────────────────────────
+
+def _ensure_vader():
+    """Download vader_lexicon on first use if missing."""
+    import nltk
+    try:
+        nltk.data.find("sentiment/vader_lexicon.zip")
+    except LookupError:
+        nltk.download("vader_lexicon", quiet=True)
+
+
+def sentiment_label(score: float) -> str:
+    if score >= 0.05:
+        return "positive"
+    if score <= -0.05:
+        return "negative"
+    return "neutral"
+
+
+def analyze_sentiment(text: str) -> dict:
+    """Return {'compound': float, 'label': str} using VADER, fallback to keyword heuristic."""
+    try:
+        import nltk
+        _ensure_vader()
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        sia = SentimentIntensityAnalyzer()
+        scores = sia.polarity_scores(text)
+        return {"compound": round(scores["compound"], 3), "label": sentiment_label(scores["compound"])}
+    except Exception:
+        # Keyword fallback
+        pos_words = {"love", "great", "amazing", "fire", "perfect", "yes", "good", "thank", "best", "true", "facts", "real", "right", "need", "wow", "insane", "exactly"}
+        neg_words = {"hate", "bad", "wrong", "no", "stop", "awful", "terrible", "worst", "gross", "stupid", "dumb", "ugh", "nope"}
+        lower = text.lower()
+        pos = sum(1 for w in pos_words if w in lower)
+        neg = sum(1 for w in neg_words if w in lower)
+        if pos > neg:
+            return {"compound": 0.4, "label": "positive"}
+        if neg > pos:
+            return {"compound": -0.4, "label": "negative"}
+        return {"compound": 0.0, "label": "neutral"}
+
+
+# ── Comment Fetching ──────────────────────────────────────
+
+def fetch_comments(url: str, max_comments: int = 50) -> list[dict]:
+    """Fetch comments via yt-dlp --write-comments. Returns list of comment dicts."""
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--write-comments",
+                "--extractor-args", f"tiktok:max_comments={max_comments};comment_reorder=likes",
+                "--dump-json",
+                "--no-playlist",
+                "--quiet",
+                url,
+            ],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            return data.get("comments") or []
+    except Exception:
+        pass
+    return []
+
+
+def is_quotable(comment: dict, sentiment_score: float) -> bool:
+    """Flag a comment as quotable if it's substantive, high-engagement, or creator-favorited."""
+    text = comment.get("text", "")
+    likes = comment.get("like_count") or 0
+    favorited = comment.get("is_favorited", False)
+    # Must be at least 40 chars, not just emoji/laughing
+    if len(text) < 40:
+        return False
+    if re.fullmatch(r"[😂🤣💀lLmMoO0\s!?.,]+", text):
+        return False
+    return likes >= 200 or favorited or sentiment_score >= 0.5
+
+
+def build_comments_section(comments: list[dict]) -> str:
+    """Build the ## Comments markdown section with sentiment analysis."""
+    if not comments:
+        return ""
+
+    # Analyze each comment
+    analyzed = []
+    for c in comments:
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        s = analyze_sentiment(text)
+        analyzed.append({
+            "text": text,
+            "author": c.get("author") or "unknown",
+            "author_id": c.get("author_id") or "",
+            "likes": c.get("like_count") or 0,
+            "favorited": c.get("is_favorited", False),
+            "compound": s["compound"],
+            "label": s["label"],
+            "quotable": is_quotable(c, s["compound"]),
+        })
+
+    if not analyzed:
+        return ""
+
+    # Sort top by likes for display
+    top = sorted(analyzed, key=lambda x: x["likes"], reverse=True)[:15]
+
+    # Sentiment summary
+    total = len(analyzed)
+    counts = {"positive": 0, "neutral": 0, "negative": 0}
+    for c in analyzed:
+        counts[c["label"]] += 1
+    pct = {k: round(v / total * 100) for k, v in counts.items()}
+
+    quotables = [c for c in analyzed if c["quotable"]]
+    quotables = sorted(quotables, key=lambda x: (x["likes"], x["compound"]), reverse=True)[:5]
+
+    lines = ["## Comments", ""]
+    lines.append(
+        f"**Sentiment:** {pct['positive']}% positive · {pct['neutral']}% neutral · {pct['negative']}% negative  "
+    )
+    lines.append(f"**Analyzed:** {total} comments")
+    lines.append("")
+
+    lines.append("### Top Comments")
+    lines.append("")
+
+    LABEL_ICON = {"positive": "✅", "neutral": "➖", "negative": "❌"}
+
+    for c in top:
+        handle = f"@{c['author_id']}" if c["author_id"] else c["author"]
+        fav_tag = " ⭐" if c["favorited"] else ""
+        likes_fmt = f"{c['likes']:,}"
+        icon = LABEL_ICON[c["label"]]
+        preview = c["text"][:200] + ("…" if len(c["text"]) > 200 else "")
+        lines.append(f"- **{handle}**{fav_tag} ({likes_fmt} likes) {icon}")
+        lines.append(f"  > {preview}")
+        lines.append("")
+
+    # Quotable block
+    if quotables:
+        lines.append("### 💬 Quotable")
+        lines.append("")
+        lines.append("*High-signal comments worth citing in articles or research:*")
+        lines.append("")
+        for c in quotables:
+            handle = f"@{c['author_id']}" if c["author_id"] else c["author"]
+            lines.append(f"> \"{c['text']}\"")
+            lines.append(f"> — {handle} ({c['likes']:,} likes)")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# ── Core Helpers ──────────────────────────────────────────
+
+def print_header():
+    print()
+    print(f"  {BOLD}{PURPLE}viddig{R}  {GRAY}bulk video transcriber{R}")
+    print(f"  {GRAY}{'─' * 36}{R}")
+    print(f"  {DIM}Saves to: {OUTPUT_DIR}{R}")
+    print()
+
+
+def prompt_urls() -> list[str]:
+    print(f"  {CYAN}Paste links — one per line.{R}")
+    print(f"  {GRAY}Press {BOLD}Enter twice{R}{GRAY} or {BOLD}Ctrl+D{R}{GRAY} when done.{R}")
+    print()
+
+    urls = []
+    blank_count = 0
+
+    try:
+        while True:
+            try:
+                line = input(f"  {GRAY}→{R} ").strip()
+            except EOFError:
+                break
+            if line == "":
+                blank_count += 1
+                if blank_count >= 2:
+                    break
+            else:
+                blank_count = 0
+                urls.append(line)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
+
+    return urls
+
+
+def dated_folder() -> str:
+    dt = datetime.today()
+    path = os.path.join(VAULT_DIR, str(dt.year), dt.strftime("%m - %B"))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def detect_platform(url: str) -> str:
+    if "tiktok.com" in url:
+        return "TikTok"
+    if "instagram.com" in url:
+        return "Instagram"
+    if "youtube.com" in url or "youtu.be" in url:
+        return "YouTube"
+    if "twitter.com" in url or "x.com" in url:
+        return "X / Twitter"
+    if "soundcloud.com" in url:
+        return "SoundCloud"
+    return "Web"
+
+
+def slug(text: str, author: str = "") -> str:
+    text = re.sub(r"#\w+", "", text)
+    text = re.sub(r"[^\w\s-]", "", text.lower())
+    text = re.sub(r"[\s_-]+", "-", text).strip("-")
+    text = text[:60]
+    if not text or re.fullmatch(r"[\d-]+", text):
+        clean_author = re.sub(r"[^\w]", "", author.lower())[:20]
+        text = f"{clean_author}-{datetime.now().strftime('%m%d-%H%M')}"
+    return text
+
+
+def fetch_metadata(url: str) -> dict | None:
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", "--quiet", url],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def fetch_subtitles(url: str, tmpdir: str) -> str | None:
+    result = subprocess.run(
+        [
+            "yt-dlp",
+            "--write-auto-subs", "--write-subs",
+            "--sub-lang", "en",
+            "--sub-format", "vtt",
+            "--skip-download",
+            "--no-playlist",
+            "--quiet",
+            "-o", os.path.join(tmpdir, "sub"),
+            url,
+        ],
+        capture_output=True, text=True, timeout=60
+    )
+    for f in os.listdir(tmpdir):
+        if f.endswith(".vtt"):
+            return os.path.join(tmpdir, f)
+    return None
+
+
+def parse_vtt(vtt_path: str) -> str:
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    lines = content.split("\n")
+    seen = set()
+    text_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        if re.match(r"^\d{2}:\d{2}", line):
+            continue
+        if re.match(r"^\d+$", line):
+            continue
+        line = re.sub(r"<[^>]+>", "", line).strip()
+        if not line:
+            continue
+        if line not in seen:
+            seen.add(line)
+            text_lines.append(line)
+        else:
+            seen = {line}
+
+    return " ".join(text_lines)
+
+
+def transcribe_with_whisper(url: str, tmpdir: str) -> str | None:
+    audio_path = os.path.join(tmpdir, "audio.mp3")
+
+    dl = subprocess.run(
+        [
+            "yt-dlp", "-x", "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--no-playlist", "--quiet",
+            "-o", audio_path,
+            url,
+        ],
+        capture_output=True, text=True, timeout=300
+    )
+
+    if dl.returncode != 0 or not os.path.exists(audio_path):
+        return None
+
+    result = subprocess.run(
+        [
+            "whisper", audio_path,
+            "--model", "tiny",
+            "--language", "en",
+            "--output_format", "txt",
+            "--output_dir", tmpdir,
+            "--verbose", "False",
+        ],
+        capture_output=True, text=True, timeout=600
+    )
+
+    txt_path = os.path.join(tmpdir, "audio.txt")
+    if os.path.exists(txt_path):
+        with open(txt_path, "r") as f:
+            return f.read().strip()
+
+    return None
+
+
+def build_markdown(meta: dict, transcript: str, platform: str, url: str, comments_section: str = "") -> str:
+    title = meta.get("title", "Untitled")
+    author = meta.get("uploader") or meta.get("channel") or meta.get("creator") or "Unknown"
+    profile_url_raw = meta.get("uploader_url") or meta.get("channel_url") or ""
+    handle_match = re.search(r"/@([\w.]+)", profile_url_raw)
+    if handle_match:
+        username = f"@{handle_match.group(1)}"
+    else:
+        username = meta.get("uploader_id") or meta.get("channel_id") or ""
+        if username and not username.startswith("@"):
+            username = f"@{username}"
+    description = (meta.get("description") or "").strip()
+    saved = datetime.today().strftime("%Y-%m-%d %H:%M")
+
+    upload_date = meta.get("upload_date", "")
+    if upload_date and len(upload_date) == 8:
+        try:
+            upload_date = datetime.strptime(upload_date, "%Y%m%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    duration = meta.get("duration_string") or meta.get("duration") or ""
+    view_count = meta.get("view_count")
+    like_count = meta.get("like_count")
+    comment_count = meta.get("comment_count")
+    share_count = meta.get("repost_count")
+    profile_url = profile_url_raw
+    tags = meta.get("tags") or []
+
+    lines = [
+        "---",
+        f'title: "{title.replace(chr(34), chr(39))}"',
+        f"author: \"{author}\"",
+    ]
+    if username:
+        lines.append(f"username: \"{username}\"")
+    lines.append(f"platform: {platform}")
+    lines.append(f"url: \"{url}\"")
+    lines.append(f"link: \"[See Post]({url})\"")
+    if profile_url:
+        lines.append(f"profile_url: \"{profile_url}\"")
+        lines.append(f"profile: \"[{username or author}]({profile_url})\"")
+    lines.append(f"saved: {saved}")
+    if upload_date:
+        lines.append(f"posted: {upload_date}")
+    if duration:
+        lines.append(f"duration: \"{duration}\"")
+    if view_count is not None:
+        lines.append(f"views: {int(view_count)}")
+    if like_count is not None:
+        lines.append(f"likes: {int(like_count)}")
+    if comment_count is not None:
+        lines.append(f"comments: {int(comment_count)}")
+    if share_count is not None:
+        lines.append(f"shares: {int(share_count)}")
+    if tags:
+        tag_str = ", ".join(f'"{t}"' for t in tags[:10])
+        lines.append(f"tags: [{tag_str}]")
+    lines.append("---")
+    lines.append("")
+
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"**Author:** {author}" + (f" ({username})" if username else ""))
+    lines.append(f"**Platform:** {platform}  ")
+    if upload_date:
+        lines.append(f"**Date:** {upload_date}  ")
+    lines.append(f"**Source:** [{url}]({url})")
+    lines.append("")
+
+    if description:
+        lines.append("## Caption")
+        lines.append("")
+        lines.append(description)
+        lines.append("")
+
+    if transcript:
+        lines.append("## Transcript")
+        lines.append("")
+        lines.append(transcript)
+        lines.append("")
+
+    if comments_section:
+        lines.append(comments_section)
+
+    return "\n".join(lines)
+
+
+# ── Registry ──────────────────────────────────────────────
+
+REGISTRY_FILE = os.path.join(REGISTRY_ROOT, ".viddig-registry.json")
+
+
+def load_registry() -> dict:
+    if os.path.exists(REGISTRY_FILE):
+        try:
+            with open(REGISTRY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_registry(registry: dict):
+    with open(REGISTRY_FILE, "w") as f:
+        json.dump(registry, f, indent=2)
+
+
+# ── Process ───────────────────────────────────────────────
+
+def process(url: str, idx: int, total: int) -> bool:
+    platform = detect_platform(url.strip())
+    url = url.strip()
+    prefix = f"  [{GRAY}{idx}/{total}{R}]"
+    short_url = (url[:70] + "...") if len(url) > 70 else url
+
+    print(f"{prefix} {DIM}{short_url}{R}")
+
+    registry = load_registry()
+    if url in registry:
+        existing = registry[url]
+        print(f"         {GRAY}◎  Already transcribed → {existing}{R}     ")
+        return True
+
+    print(f"         {YELLOW}◌  Fetching metadata...{R}", end="", flush=True)
+    meta = fetch_metadata(url)
+    if not meta:
+        print(f"\r         {RED}✗  Could not fetch metadata{R}                   ")
+        return False
+
+    title = meta.get("title", "untitled")
+    author = meta.get("uploader") or meta.get("channel") or "unknown"
+    print(f"\r         {GREEN}✓  {author} — {title[:50]}{R}                      ")
+
+    transcript = None
+
+    print(f"         {YELLOW}◌  Looking for subtitles...{R}", end="", flush=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vtt_path = fetch_subtitles(url, tmpdir)
+
+        if vtt_path:
+            transcript = parse_vtt(vtt_path)
+            print(f"\r         {GREEN}✓  Subtitles found{R}                        ")
+        else:
+            print(f"\r         {YELLOW}◌  No subtitles — transcribing with Whisper...{R}", end="", flush=True)
+            transcript = transcribe_with_whisper(url, tmpdir)
+            if transcript:
+                print(f"\r         {GREEN}✓  Whisper transcription done{R}              ")
+            else:
+                print(f"\r         {YELLOW}⚠  No transcript available{R}                ")
+
+        # Fetch and analyze comments for TikTok, Instagram, X
+        comments_section = ""
+        if platform in ("TikTok", "Instagram", "X / Twitter"):
+            print(f"         {YELLOW}◌  Fetching comments...{R}", end="", flush=True)
+            raw_comments = fetch_comments(url)
+            if raw_comments:
+                comments_section = build_comments_section(raw_comments)
+                print(f"\r         {GREEN}✓  {len(raw_comments)} comments analyzed{R}              ")
+            else:
+                print(f"\r         {GRAY}–  No comments fetched{R}                   ")
+
+        folder = dated_folder()
+        md = build_markdown(meta, transcript or "", platform, url, comments_section)
+        filename = f"{slug(title, author)}.md"
+        out_path = os.path.join(folder, filename)
+
+        if os.path.exists(out_path):
+            base = slug(title, author)
+            out_path = os.path.join(folder, f"{base}-{idx}.md")
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(md)
+
+    registry[url] = os.path.basename(out_path)
+    save_registry(registry)
+
+    print(f"         {GREEN}✓  Saved → {GRAY}{os.path.basename(out_path)}{R}")
+    return True
+
+
+# ── Entry ─────────────────────────────────────────────────
+
+def main():
+    print_header()
+
+    if not sys.stdin.isatty():
+        urls = [line.strip() for line in sys.stdin if line.strip()]
+    else:
+        urls = prompt_urls()
+
+    if not urls:
+        print(f"\n  {GRAY}No links entered. Exiting.{R}\n")
+        sys.exit(0)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print()
+    print(f"  {BOLD}Processing {len(urls)} video{'s' if len(urls) != 1 else ''}...{R}")
+    print(f"  {GRAY}{'─' * 36}{R}")
+    print()
+
+    ok = 0
+    fail = 0
+
+    for i, url in enumerate(urls, 1):
+        if process(url, i, len(urls)):
+            ok += 1
+        else:
+            fail += 1
+        print()
+
+    print(f"  {GRAY}{'─' * 36}{R}")
+    if fail == 0:
+        print(f"  {GREEN}{BOLD}✓ {ok} transcribed{R}  →  {GRAY}{OUTPUT_DIR}{R}")
+    else:
+        print(f"  {GREEN}✓ {ok} done{R}  {RED}✗ {fail} failed{R}  →  {GRAY}{OUTPUT_DIR}{R}")
+    print()
+
+    subprocess.Popen(["open", OUTPUT_DIR])
+
+
+if __name__ == "__main__":
+    main()
