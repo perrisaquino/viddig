@@ -19,7 +19,7 @@ YELLOW = "\033[38;5;221m"
 CYAN = "\033[38;5;117m"
 GRAY = "\033[38;5;245m"
 
-VAULT_DIR = str(Path.home() / "Local Documents" / "Main Second Brain (Local)" / "Research" / "VidDig")
+VAULT_DIR = str(Path.home() / "Documents" / "VidDig")
 OUTPUT_DIR = VAULT_DIR
 REGISTRY_ROOT = VAULT_DIR
 
